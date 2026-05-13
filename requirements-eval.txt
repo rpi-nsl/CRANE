@@ -1,0 +1,27 @@
+# Evaluation-side dependencies for the three benchmarks.
+# Install in a SEPARATE venv from requirements.txt — vLLM and OpenHands
+# pin incompatible versions of litellm and pydantic from the merge-time
+# requirements, so we keep them apart by convention.
+#
+# Suggested layout (see env.sh):
+#   $CRANE_REPO_ROOT/.venv               # requirements.txt + vllm 0.19.0
+#   $CRANE_REPO_ROOT/.venv-openhands     # OpenHands SDK + swebench 4.1.0
+#   $CRANE_REPO_ROOT/.venv-tb            # terminal-bench harness
+
+# vLLM serving (Roo-Eval, SWE-bench, Terminal-Bench all serve vLLM
+# locally; paper §A.1 pins vllm==0.19.0):
+vllm==0.19.0
+flashinfer-python  # built against CUDA 12.8+, may JIT on first launch
+
+# Roo-Eval drives Roo-Code over HTTP; only needs requests/openai.
+openai>=1.0.0
+
+# SWE-bench-Verified harness:
+# Install OpenHands from github at the pinned commit (see
+# swe_bench/UPSTREAM.md). swebench is on PyPI.
+swebench==4.1.0
+litellm
+podman-py  # optional, used for ad-hoc inspection; harness uses subprocess
+
+# Terminal-Bench v2:
+terminal-bench

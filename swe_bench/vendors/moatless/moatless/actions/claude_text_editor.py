@@ -1,0 +1,357 @@
+import logging
+from pathlib import Path
+from typing import Literal, Optional
+
+from pydantic import ConfigDict, Field, PrivateAttr, field_validator, model_validator
+
+from moatless.actions import CreateFile
+from moatless.actions.action import Action, CompletionModelMixin
+from moatless.actions.code_modification_mixin import CodeModificationMixin
+from moatless.actions.create_file import CreateFileArgs
+from moatless.actions.schema import ActionArguments, Observation
+from moatless.actions.string_replace import StringReplace, StringReplaceArgs
+from moatless.actions.view_code import CodeSpan, ViewCode, ViewCodeArgs
+from moatless.completion.schema import (
+    ChatCompletionToolParam,
+    ChatCompletionToolParamFunctionChunk,
+)
+from moatless.file_context import FileContext
+from moatless.repository.file import do_diff
+from moatless.repository.repository import Repository
+from moatless.workspace import Workspace
+
+logger = logging.getLogger(__name__)
+
+Command = Literal[
+    "view",
+    "create",
+    "str_replace",
+    "insert",
+    "undo_edit",
+]
+
+SNIPPET_LINES: int = 4
+
+
+class EditActionArguments(ActionArguments):
+    """
+    An filesystem editor tool that allows the agent to view, create, and edit files.
+    """
+
+    model_config = ConfigDict(title="str_replace_editor")
+
+    command: Command = Field(..., description="The edit command to execute")
+    path: str = Field(..., description="The file path to edit")
+    file_text: Optional[str] = Field(None, description="The text content for file creation")
+    view_range: Optional[list[int]] = Field(None, description="Range of lines to view [start, end]")
+    old_str: Optional[str] = Field(None, description="String to replace")
+    new_str: Optional[str] = Field(None, description="Replacement string")
+    insert_line: Optional[int] = Field(None, description="Line number for insertion")
+
+    @classmethod
+    def tool_schema(cls, thoughts_in_action: bool = False) -> ChatCompletionToolParam:
+        return ChatCompletionToolParam(
+            type="text_editor_20250124",
+            function=ChatCompletionToolParamFunctionChunk(name="str_replace_editor"),
+        )
+
+    @field_validator("file_text")
+    @classmethod
+    def validate_file_text(cls, v, info):
+        if info.data.get("command") == "create" and not v:
+            raise ValueError("Parameter `file_text` is required for command: create")
+        return v
+
+    @field_validator("old_str")
+    @classmethod
+    def validate_old_str(cls, v, info):
+        if info.data.get("command") == "str_replace" and not v:
+            raise ValueError("Parameter `old_str` is required for command: str_replace")
+        return v
+
+    @field_validator("new_str")
+    @classmethod
+    def validate_new_str(cls, v, info):
+        if info.data.get("command") == "str_replace" and v is None:
+            raise ValueError(
+                "Parameter `new_str` cannot be null for command: str_replace. Return an empty string if your intention was to remove old_str."
+            )
+        if info.data.get("command") == "insert" and v is None:
+            raise ValueError("Parameter `new_str` is required for command: insert")
+        return v
+
+    @field_validator("insert_line")
+    @classmethod
+    def validate_insert_line(cls, v, info):
+        if info.data.get("command") == "insert" and v is None:
+            raise ValueError("Parameter `insert_line` is required for command: insert")
+        return v
+
+    @field_validator("view_range")
+    @classmethod
+    def validate_view_range(cls, v):
+        if v is not None and len(v) != 2:
+            raise ValueError("Invalid view_range. It should be a list of two integers.")
+        return v
+
+    @field_validator("command")
+    @classmethod
+    def validate_command(cls, v):
+        valid_commands = {"view", "create", "str_replace", "insert", "undo_edit"}
+        if v not in valid_commands:
+            raise ValueError(f"Unknown command: {v}")
+        return v
+
+    def create_args(self):
+        if self.command == "str_replace":
+            return StringReplaceArgs(
+                path=self.path,
+                old_str=self.old_str,
+                new_str=self.new_str,
+                thoughts=self.thoughts,
+            )
+        elif self.command == "create":
+            return CreateFileArgs(
+                path=self.path,
+                file_text=self.file_text,
+                thoughts=self.thoughts,
+            )
+
+        return None
+
+    @model_validator(mode="after")
+    def validate_args(self, **kwargs):
+        if self.command == "str_replace":
+            StringReplaceArgs.model_validate(self.model_dump())
+
+        # TODO: Validate all other commands
+        return self
+
+    def _short_str(self, str: str):
+        str_split = str.split("\n")
+        return str_split[0][:20]
+
+    def short_summary(self) -> str:
+        param_str = f'command="{self.command}", path="{self.path}"'
+        return f"{self.name}({param_str})"
+
+
+class ClaudeEditTool(Action, CodeModificationMixin, CompletionModelMixin):
+    """
+    An filesystem editor tool that allows the agent to view, create, and edit files.
+    The tool parameters are defined by Anthropic and are not editable.
+    """
+
+    args_schema = EditActionArguments
+
+    max_tokens_to_view: int = Field(2000, description="Max tokens to view in one command")
+
+    _str_replace: StringReplace = PrivateAttr()
+    _create_file: CreateFile = PrivateAttr()
+    _view_code: ViewCode = PrivateAttr()
+
+    _repository: Repository | None = PrivateAttr(None)
+
+    def __init__(
+        self,
+        **data,
+    ):
+        super().__init__(**data)
+        self._str_replace = StringReplace()
+        self._create_file = CreateFile()
+        self._view_code = ViewCode(completion_model=self.completion_model)
+
+    def _initialize_completion_model(self):
+        self._view_code._initialize_completion_model()
+
+    async def execute(self, args: EditActionArguments, file_context: FileContext | None = None) -> Observation:
+        # Claude tends to add /repo in the start of the file path.
+        # TODO: Maybe we should add /repo as default on all paths?
+        if args.path.startswith("/repo"):
+            args.path = args.path[5:]
+
+        # Remove leading `/` if present
+        # TODO: Solve by adding /repo to all paths?
+        if args.path.startswith("/"):
+            args.path = args.path[1:]
+
+        path = Path(args.path)
+
+        validation_error = self.validate_path(file_context, args.command, path)
+        if validation_error:
+            return Observation.create(message=validation_error, properties={"fail_reason": "invalid_path"})
+
+        if args.command == "view":
+            return await self._view(file_context, path, args)
+        elif args.command == "create":
+            return await self._create_file.execute(
+                CreateFileArgs(
+                    path=args.path,
+                    file_text=args.file_text,
+                    thoughts=args.thoughts,
+                ),
+                file_context,
+            )
+        elif args.command == "str_replace":
+            return await self._str_replace.execute(
+                StringReplaceArgs(
+                    path=args.path,
+                    old_str=args.old_str,
+                    new_str=args.new_str or "",
+                    thoughts=args.thoughts,
+                ),
+                file_context,
+            )
+        elif args.command == "insert":
+            observation = await self._insert(file_context, path, args.insert_line, args.new_str)
+        else:
+            return Observation.create(
+                message=f"Unknown command: {args.command}",
+                properties={"fail_reason": "unknwon_command"},
+            )
+
+        if not observation.properties or not observation.properties.get("diff"):
+            return observation
+
+        if not self._runtime:
+            return observation
+
+        return observation
+
+    @property
+    def workspace(self) -> Workspace:
+        if not self._workspace:
+            raise ValueError("Workspace is not set")
+        return self._workspace
+
+    async def initialize(self, workspace: Workspace):
+        self.workspace = workspace
+
+    @workspace.setter
+    def workspace(self, value: Workspace):
+        self._workspace = value
+        self._view_code.workspace = value
+        self._str_replace.workspace = value
+        self._create_file.workspace = value
+
+    def _initialize_completion_model(self):
+        if self.completion_model:
+            self._view_code.completion_model = self.completion_model.clone()
+            self._view_code._initialize_completion_model()
+
+    def validate_path(self, file_context: FileContext, command: str, path: Path) -> str | None:
+        """
+        Check that the path/command combination is valid.
+        """
+        # TODO: Check if its an absolute path?
+        # if not path.is_absolute():
+        #    suggested_path = Path("") / path
+        #    return (
+        #        f"The path {path} is not an absolute path, it should start with `/`. Maybe you meant {suggested_path}?"
+        #    )
+
+        if not file_context.file_exists(str(path)) and command != "create":
+            return f"The path {path} does not exist. Please provide a valid path."
+
+        if file_context.file_exists(str(path)) and command == "create":
+            return f"File already exists at: {path}. Cannot overwrite files using command `create`."
+
+        if file_context._repo.is_directory(str(path)) and command != "view":
+            return f"The path {path} is a directory and only the `view` command can be used on directories"
+
+        return None
+
+    async def _view(self, file_context: FileContext, path: Path, args: EditActionArguments) -> Observation:
+        codespan = CodeSpan(file_path=str(path))
+
+        view_range = args.view_range
+        if view_range:
+            codespan.start_line, codespan.end_line = view_range
+
+        view_code_args = ViewCodeArgs(thoughts=args.thoughts, files=[codespan])
+        return await self._view_code.execute(view_code_args, file_context=file_context)
+
+    async def _insert(self, file_context: FileContext, path: Path, insert_line: int, new_str: str) -> Observation:
+        context_file = file_context.get_context_file(str(path))
+        if not context_file:
+            return Observation.create(
+                message=f"Could not get context for file: {path}",
+                properties={"fail_reason": "context_error"},
+            )
+
+        # Validate file exists and is not a directory
+        if not file_context.file_exists(str(path)):
+            return Observation.create(
+                message=f"File {path} not found.",
+                properties={"fail_reason": "file_not_found"},
+            )
+        file_text = context_file.content.expandtabs()
+        new_str = new_str.expandtabs()
+        file_text_lines = file_text.split("\n")
+        n_lines_file = len(file_text_lines)
+
+        if insert_line < 0 or insert_line > len(file_text_lines):
+            return Observation.create(
+                message=f"Invalid `insert_line` parameter: {insert_line}. It should be within the range of lines of the file: {[0, n_lines_file]}",
+                properties={"fail_reason": "invalid_line_number"},
+            )
+
+        new_str_lines = new_str.split("\n")
+        new_file_text_lines = file_text_lines[:insert_line] + new_str_lines + file_text_lines[insert_line:]
+        snippet_lines = (
+            file_text_lines[max(0, insert_line - SNIPPET_LINES) : insert_line]
+            + new_str_lines
+            + file_text_lines[insert_line : insert_line + SNIPPET_LINES]
+        )
+
+        new_file_text = "\n".join(new_file_text_lines)
+        snippet = "\n".join(snippet_lines)
+
+        diff = do_diff(str(path), file_text, new_file_text)
+        context_file.apply_changes(new_file_text)
+
+        success_msg = f"The file {path} has been edited. "
+        success_msg += self._make_output(
+            snippet,
+            "a snippet of the edited file",
+            max(1, insert_line - SNIPPET_LINES + 1),
+        )
+        success_msg += "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary."
+
+        return Observation.create(
+            message=success_msg,
+            properties={"diff": diff},
+        )
+
+    def _make_output(
+        self,
+        file_content: str,
+        file_descriptor: str,
+        init_line: int = 1,
+        expand_tabs: bool = True,
+    ):
+        """Generate output for the CLI based on the content of a file."""
+        file_content = maybe_truncate(file_content)
+        if expand_tabs:
+            file_content = file_content.expandtabs()
+        file_content = "\n".join([f"{i + init_line:6}\t{line}" for i, line in enumerate(file_content.split("\n"))])
+        return f"Here's the result of running `cat -n` on {file_descriptor}:\n" + file_content + "\n"
+
+    def span_id_list(self, span_ids: set[str]) -> str:
+        list_str = ""
+        for span_id in span_ids:
+            list_str += f" * {span_id}\n"
+        return list_str
+
+
+TRUNCATED_MESSAGE: str = "<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
+MAX_RESPONSE_LEN: int = 16000
+
+
+def maybe_truncate(content: str, truncate_after: int | None = MAX_RESPONSE_LEN):
+    """Truncate content and append a notice if content exceeds the specified length."""
+    return (
+        content
+        if not truncate_after or len(content) <= truncate_after
+        else content[:truncate_after] + TRUNCATED_MESSAGE
+    )

@@ -1,0 +1,378 @@
+name: Build SWT-Bench Images
+
+run-name: >-
+  Build SWT-Bench Images
+  ${{ github.event_name == 'workflow_dispatch' && inputs.sdk-commit != '' && format('(SDK: {0})', inputs.sdk-commit) || '' }}
+
+on:
+  # Called from evaluation repo (eval-job.yml) to build images before K8s evaluation
+  workflow_call:
+    inputs:
+      sdk-commit:
+        description: 'Software Agent SDK commit/ref to use'
+        required: true
+        type: string
+      n-limit:
+        description: 'Limit number of images to build (0 for all)'
+        required: false
+        type: string
+        default: '0'
+      instance-ids:
+        description: 'Comma-separated instance IDs to build (optional, overrides n-limit)'
+        required: false
+        type: string
+        default: ''
+      agent-type:
+        description: 'Agent type: default (skip ACP), acp-claude, acp-codex (keep ACP)'
+        required: false
+        type: string
+        default: 'default'
+      benchmarks-ref:
+        description: 'Benchmarks repo ref to checkout (for cross-repo calls)'
+        required: false
+        type: string
+        default: ''
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: 'Dataset name (e.g., eth-sri/SWT-bench_Verified_bm25_27k_zsp)'
+        required: true
+        default: 'eth-sri/SWT-bench_Verified_bm25_27k_zsp'
+        type: string
+      split:
+        description: 'Dataset split'
+        required: true
+        default: 'test'
+        type: string
+      max-workers:
+        description: 'Maximum number of parallel workers'
+        required: false
+        default: '4'
+        type: string
+      n-limit:
+        description: 'Limit number of images to build (0 for all)'
+        required: false
+        default: '0'
+        type: string
+      instance-ids:
+        description: 'Comma-separated instance IDs to build (optional, overrides n-limit)'
+        required: false
+        default: ''
+        type: string
+      sdk-commit:
+        description: 'Software Agent SDK commit/ref to use'
+        required: true
+        type: string
+      extensions-ref:
+        description: 'Extensions repository branch/ref to use (for testing feature branches with skills/plugins). Leave blank to use main.'
+        required: false
+        default: 'main'
+        type: string
+      build-eval-env:
+        description: 'Also build prebaked SWT-bench eval env images (default: false)'
+        required: false
+        default: 'false'
+        type: string
+      eval-image-prefix:
+        description: 'Registry prefix for prebaked eval images'
+        required: false
+        default: 'ghcr.io/openhands/swtbench-eval'
+        type: string
+      max-retries:
+        description: 'Retries per batch for eval env builds'
+        required: false
+        default: '2'
+        type: string
+      eval-env-build-batch-size:
+        description: 'Env images per batch for eval env builds'
+        required: false
+        default: '10'
+        type: string
+      force-build:
+        description: 'Rebuild images even if matching remote tags already exist'
+        required: false
+        default: 'false'
+        type: string
+      agent-type:
+        description: 'Agent type: default (skip ACP), acp-claude, acp-codex (keep ACP)'
+        required: false
+        default: 'default'
+        type: string
+
+concurrency:
+  group: build-swt-bench-${{ inputs.sdk-commit || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.label.name == 'build-swt-bench')
+    # 10h matches the old orchestrate_eval.py polling bound in the evaluation repo.
+    # See #527 for context on past timeout experiments; if large benchmark builds
+    # regress past 10h again, reopen that discussion rather than silently raising.
+    timeout-minutes: 600
+
+    runs-on: ubuntu-latest-8core
+
+    permissions:
+      contents: read
+      packages: write
+      issues: write
+
+    # Resolve inputs with fallback defaults so both workflow_dispatch and
+    # pull_request_target triggers work without a separate override step.
+    # INSTANCE_IDS/SELECT_FILE must be initialized for set -euo pipefail.
+    env:
+      DATASET: ${{ inputs.dataset || 'eth-sri/SWT-bench_Verified_bm25_27k_zsp' }}
+      SPLIT: ${{ inputs.split || 'test' }}
+      MAX_WORKERS: ${{ inputs.max-workers || '4' }}
+      N_LIMIT: ${{ inputs.n-limit || '0' }}
+      INSTANCE_IDS: ${{ inputs.instance-ids || '' }}
+      SELECT_FILE: ''
+
+    steps:
+      - name: Determine checkout ref
+        id: checkout-ref
+        run: |
+          if [ -n "${{ inputs.benchmarks-ref }}" ]; then
+            echo "ref=${{ inputs.benchmarks-ref }}" >> "$GITHUB_OUTPUT"
+            echo "Using benchmarks-ref: ${{ inputs.benchmarks-ref }}"
+          elif [ -n "${{ github.event.pull_request.head.sha }}" ]; then
+            echo "ref=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "Using PR head SHA: ${{ github.event.pull_request.head.sha }}"
+          else
+            echo "ref=" >> "$GITHUB_OUTPUT"
+            echo "Using default ref (the commit that triggered this workflow)"
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          repository: OpenHands/benchmarks
+          ref: ${{ steps.checkout-ref.outputs.ref }}
+          submodules: recursive
+          token: ${{ github.token }}
+
+      - uses: ./.github/actions/build-select-file
+        with:
+          instance-ids: ${{ env.INSTANCE_IDS }}
+
+      - name: Update SDK submodule
+        if: ${{ inputs.sdk-commit != '' }}
+        run: |
+          cd vendor/software-agent-sdk
+          git fetch origin ${{ inputs.sdk-commit }}
+          git checkout FETCH_HEAD
+          SDK_SHA=$(git rev-parse HEAD)
+          cd ../..
+          git add vendor/software-agent-sdk
+          echo "Updated SDK submodule to $SDK_SHA (from ${{ inputs.sdk-commit }})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          make build
+
+      - name: Build and push SWT-Bench images
+        run: |
+          set -euo pipefail
+
+          MAX_RETRIES="${{ inputs.max-retries || '3' }}"
+          FORCE_BUILD="${{ inputs.force-build || 'false' }}"
+
+          CMD="uv run benchmarks/swebench/build_images.py \
+            --dataset '${DATASET}' \
+            --split '${SPLIT}' \
+            --image ghcr.io/openhands/eval-agent-server \
+            --push \
+            --max-workers '${MAX_WORKERS}' \
+            --max-retries '${MAX_RETRIES}'"
+
+          if [ "${N_LIMIT}" != "0" ]; then
+            CMD="$CMD --n-limit '${N_LIMIT}'"
+          fi
+          if [ -n "${SELECT_FILE}" ]; then
+            CMD="$CMD --select '${SELECT_FILE}'"
+          fi
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            CMD="$CMD --force-build"
+          fi
+          CMD="$CMD --agent-type ${AGENT_TYPE}"
+
+          echo "Running: $CMD"
+          eval "$CMD"
+        env:
+          DOCKER_BUILDKIT: 1
+          BUILDKIT_PROGRESS: plain
+          EXTENSIONS_REF: ${{ inputs.extensions-ref || 'main' }}
+          AGENT_TYPE: ${{ inputs.agent-type || 'default' }}
+
+      - name: Build prebaked eval env images
+        if: ${{ inputs.build-eval-env == 'true' }}
+        run: |
+          set -euo pipefail
+
+          echo "Starting prebaked eval env image build at $(date -u)"
+          echo "Runner: $(uname -a)"
+          df -h
+          docker system df || true
+          docker info || true
+
+          DATASET="${{ inputs.dataset || 'eth-sri/SWT-bench_Verified_bm25_27k_zsp' }}"
+          SPLIT="${{ inputs.split || 'test' }}"
+          N_LIMIT="${{ inputs.n-limit || '0' }}"
+          INSTANCE_IDS="${{ inputs.instance-ids }}"
+          IMAGE_PREFIX="${{ inputs.eval-image-prefix || 'ghcr.io/openhands/swtbench-eval' }}"
+          MAX_WORKERS="${{ inputs.max-workers || '4' }}"
+          BUILD_MODE="${{ inputs.build-mode || 'cli' }}"
+          MAX_RETRIES="${{ inputs.max-retries || '2' }}"
+          BUILD_BATCH_SIZE="${{ inputs.eval-env-build-batch-size || '10' }}"
+          FORCE_BUILD="${{ inputs.force-build || 'false' }}"
+
+          echo "N_LIMIT=${N_LIMIT}" >> "$GITHUB_ENV"
+          echo "MAX_RETRIES=${MAX_RETRIES}" >> "$GITHUB_ENV"
+          echo "BUILD_BATCH_SIZE=${BUILD_BATCH_SIZE}" >> "$GITHUB_ENV"
+
+          # Basic BuildKit disk guard similar to SWE-bench
+          if df -B1 /var/lib/buildkit > /tmp/buildkit_df 2>/dev/null; then
+            LINE=$(tail -n1 /tmp/buildkit_df)
+            TOTAL=$(echo "$LINE" | awk '{print $2}')
+            USED=$(echo "$LINE" | awk '{print $3}')
+            FREE=$(echo "$LINE" | awk '{print $4}')
+            if [ -n "$TOTAL" ] && [ -n "$FREE" ]; then
+              PCT=$(( 100 * USED / TOTAL ))
+              echo "BuildKit disk: used ${USED} / ${TOTAL} bytes (${PCT}%); free ${FREE} bytes"
+            else
+              echo "Warning: unable to parse df output for /var/lib/buildkit"
+            fi
+          else
+            echo "Warning: /var/lib/buildkit not found; skipping disk check"
+          fi
+
+          ARGS=(--dataset "${DATASET}" --split "${SPLIT}" --image-prefix "${IMAGE_PREFIX}" --max-workers "${MAX_WORKERS}" --build-mode "${BUILD_MODE}" --max-retries "${MAX_RETRIES}" --build-batch-size "${BUILD_BATCH_SIZE}")
+          if [ -n "${INSTANCE_IDS}" ]; then
+            ARGS+=(--instance-ids "${INSTANCE_IDS}")
+          else
+            ARGS+=(--eval-limit "${N_LIMIT}")
+          fi
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            ARGS+=(--force-build)
+          fi
+
+          echo "Running prebaked eval image build: uv run swtbench-build-eval-images ${ARGS[*]}"
+          DOCKER_BUILDKIT=1 \
+          BUILDKIT_PROGRESS=plain \
+          BUILDKIT_RESET_ON_FAILURE=1 \
+          PYTHONUNBUFFERED=1 uv run swtbench-build-eval-images "${ARGS[@]}" | tee build_eval_env.log
+
+          echo "Completed prebaked eval env image build at $(date -u)"
+          docker ps -a || true
+          docker system df || true
+
+      - name: Archive build logs
+        if: always()
+        run: |
+          if [ -d builds ]; then
+            tar -czf build-logs.tar.gz builds/
+            echo "Build logs archived successfully"
+          else
+            echo "No builds directory found"
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: build-logs.tar.gz
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Display build summary
+        if: always()
+        run: |
+          uv run python -m benchmarks.scripts.summarize_build_manifests \
+            --build-root builds \
+            --title "SWT-Bench Image Build Summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make prebaked eval image package public (best-effort)
+        if: ${{ inputs.build-eval-env == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PREFIX: ${{ inputs.eval-image-prefix || 'ghcr.io/openhands/swtbench-eval' }}
+        run: |
+          set -euo pipefail
+          NAME=$(echo "${IMAGE_PREFIX}" | awk -F/ '{print $NF}')
+          if [ -z "$NAME" ]; then
+            echo "No package name derived from IMAGE_PREFIX=${IMAGE_PREFIX}, skipping visibility update"
+            exit 0
+          fi
+          gh api -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            /orgs/OpenHands/packages/container/${NAME}/visibility \
+            -f visibility=public || echo "Warning: failed to set package visibility"
+
+      - name: Comment on tracker issue
+        if: success()
+        run: |
+          # Get SDK version
+          SDK_SHA=$(git submodule status vendor/software-agent-sdk | awk '{print $1}' | sed 's/^[+-]//')
+          SDK_SHA_SHORT=${SDK_SHA:0:7}
+
+          # Read build summary
+          MANIFEST_FILE=$(find builds -name "manifest.jsonl" -type f 2>/dev/null | head -1 || true)
+
+          if [ -z "$MANIFEST_FILE" ]; then
+            echo "No manifest file found"
+            exit 0
+          fi
+
+          TOTAL_IMAGES=$(wc -l < "$MANIFEST_FILE")
+          SUCCESS_COUNT=$(grep -c '"error":null' "$MANIFEST_FILE" || echo 0)
+
+          # Determine trigger source
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TRIGGER="Manual trigger (workflow_dispatch)"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            TRIGGER="Pull request [#${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})"
+          else
+            TRIGGER="${{ github.event_name }}"
+          fi
+
+          # Post comment using jq to properly handle multi-line content
+          jq -n \
+            --arg sdk_short "${SDK_SHA_SHORT}" \
+            --arg sdk_full "${SDK_SHA}" \
+            --arg total "$TOTAL_IMAGES" \
+            --arg success "$SUCCESS_COUNT" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg server_url "${{ github.server_url }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg trigger "${TRIGGER}" \
+            '{body: "## SWT-Bench Image Build Complete ✅\n\n**SDK Version:** [`\($sdk_short)`](https://github.com/OpenHands/software-agent-sdk/commit/\($sdk_full))\n**Images Built:** \($success)/\($total)\n**Workflow Run:** [#\($run_id)](\($server_url)/\($repo)/actions/runs/\($run_id))\n**Triggered by:** \($trigger)\n\nSWT-Bench images have been built and pushed to ghcr.io/openhands/eval-agent-server."}' | \
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/81/comments" \
+            -d @-
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

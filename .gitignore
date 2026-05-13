@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Logs and run outputs
+logs/
+*.log
+sbatch_log/
+eval-results/
+eval_results/
+traj/
+trajectories/
+runs/
+*-jobs/
+
+# Merged checkpoints + per-run scratch
+merged_model/
+baseline/baseline_model/
+output/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Caches and intermediate artifacts
+data/
+.cache/
+*.zst
+*.tar
+*.tar.gz
+*.tar.zst
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Roo-Code-Evals — referenced (not vendored), clone via roo_test/UPSTREAM.md
+roo_test/evals/
+
+# Vendored upstreams: source trees ARE tracked at the pinned commit (see each
+# subdir's UPSTREAM.md), but build artifacts and dependency caches are not —
+# they regenerate with `pnpm install`/`pip install -e`.
+roo_test/Roo-Code/node_modules/
+roo_test/Roo-Code/**/node_modules/
+roo_test/Roo-Code/**/dist/
+roo_test/Roo-Code/**/build/
+roo_test/Roo-Code/**/.next/
+roo_test/Roo-Code/**/.turbo/
+roo_test/Roo-Code/**/*.tsbuildinfo
+roo_test/Roo-Code/**/coverage/
+roo_test/Roo-Code/releases/
+roo_test/Roo-Code/**/*.vsix
+roo_test/Roo-Code/.env
+
+terminal_bench/upstream/**/node_modules/
+terminal_bench/upstream/**/__pycache__/
+terminal_bench/upstream/**/.venv/
+terminal_bench/upstream/**/dist/
+terminal_bench/upstream/**/build/
+
+swe_bench/vendors/**/node_modules/
+swe_bench/vendors/**/__pycache__/
+swe_bench/vendors/**/.venv/
+swe_bench/vendors/**/dist/
+swe_bench/vendors/**/build/
+swe_bench/vendors/**/*.egg-info/
+
+baseline/rain_upstream/**/__pycache__/
+baseline/rain_upstream/**/.venv/
+roo_test/Roo-Code/.env.local
+roo_test/Roo-Code/**/.env.*.local
+
+# Checkpoint placeholders (download via checkpoints/README.md)
+checkpoints/*
+!checkpoints/README.md
+!checkpoints/.gitkeep

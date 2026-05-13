@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable, Iterator, List, Sequence, cast
+
+import docker
+from docker.errors import ImageNotFound
+
+from benchmarks.swtbench.config import EVAL_DEFAULTS
+from benchmarks.swtbench.image_utils import ensure_swt_bench_repo
+from benchmarks.utils.build_utils import default_build_output_dir
+from benchmarks.utils.dataset import get_dataset
+from benchmarks.utils.image_utils import remote_image_exists
+from openhands.sdk import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def patch_swt_force_rebuild_remove_image() -> None:
+    """
+    Make SWT's force-rebuild path tolerate missing local images.
+
+    The upstream SWT helper blindly removes local tags before rebuilding. On a
+    clean runner those tags often do not exist yet, and force-build should not
+    fail on a 404 from the local Docker daemon.
+    """
+
+    docker_build = cast(Any, importlib.import_module("src.docker_build"))
+    docker_utils = cast(Any, importlib.import_module("src.docker_utils"))
+    original_remove_image = docker_utils.remove_image
+
+    if getattr(docker_utils.remove_image, "_openhands_missing_ok", False):
+        return
+
+    def remove_image_missing_ok(client, image_id, logger=None):
+        try:
+            return original_remove_image(client, image_id, logger)
+        except ImageNotFound:
+            if logger != "quiet":
+                raise
+            return None
+
+    remove_image_missing_ok._openhands_missing_ok = True  # type: ignore[attr-defined]
+    docker_utils.remove_image = remove_image_missing_ok
+    docker_build.remove_image = remove_image_missing_ok
+
+
+def select_instance_ids(
+    dataset: str,
+    split: str,
+    eval_limit: int | None,
+    selected_instances_file: str | None,
+    instance_ids: list[str] | None,
+) -> list[str]:
+    """
+    Select the instance IDs that match the inference sampling logic.
+    """
+    if instance_ids:
+        return instance_ids
+
+    df = get_dataset(
+        dataset_name=dataset,
+        split=split,
+        eval_limit=eval_limit,
+        selected_instances_file=selected_instances_file,
+    )
+    ids = df["instance_id"].tolist()
+    if not ids:
+        raise RuntimeError("No instances selected for image build.")
+    logger.info("Selected %s instances for image build", len(ids))
+    return ids
+
+
+def load_exec_specs(
+    swt_bench_dir: Path,
+    dataset: str,
+    split: str,
+    instance_ids: Iterable[str],
+    filter_swt: bool = True,
+) -> list:
+    """
+    Load ExecSpec objects for the provided instance IDs.
+    """
+    sys.path.insert(0, str(swt_bench_dir / "src"))
+    sys.path.insert(0, str(swt_bench_dir))
+    from src.dataset import load_swebench_dataset  # type: ignore[import-not-found]
+    from src.exec_spec import make_exec_spec  # type: ignore[import-not-found]
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(swt_bench_dir)
+        dataset_entries = load_swebench_dataset(
+            name=dataset, split=split, is_swt=False, filter_swt=filter_swt
+        )
+    finally:
+        os.chdir(cwd)
+    by_id = {entry["instance_id"]: entry for entry in dataset_entries}
+
+    specs = []
+    missing = []
+    for iid in instance_ids:
+        if iid not in by_id:
+            missing.append(iid)
+            continue
+        specs.append(make_exec_spec(by_id[iid]))
+
+    if missing:
+        logger.warning(
+            "Skipped %s missing instance_ids not found in dataset: %s",
+            len(missing),
+            ", ".join(missing[:5]),
+        )
+    if not specs:
+        raise RuntimeError("No ExecSpecs available after filtering instance IDs.")
+    return specs
+
+
+def build_env_images(
+    exec_specs: list,
+    max_workers: int,
+    build_mode: str,
+    max_retries: int,
+    batch_size: int,
+    image_prefix: str | None,
+    force_build: bool = False,
+) -> dict[str, object]:
+    """
+    Build base + environment images required by the provided ExecSpecs.
+
+    Images are pushed immediately after each successful build when image_prefix is set,
+    so partial progress is kept if the workflow fails mid-run.
+    """
+    from src.docker_build import (  # type: ignore[import-not-found]
+        BuildImageError,
+        build_base_images,
+        build_env_images as build_envs,
+    )
+
+    client = docker.from_env()
+    if force_build:
+        patch_swt_force_rebuild_remove_image()
+    from src.docker_utils import remove_image  # type: ignore[import-not-found]
+
+    total_base = len({spec.base_image_key for spec in exec_specs})
+    total_env = len({spec.env_image_key for spec in exec_specs})
+    remote_prefix = image_prefix.rstrip("/") if image_prefix else None
+    overall_started = time.monotonic()
+    base_build_seconds = 0.0
+    env_build_seconds = 0.0
+    push_seconds = 0.0
+    batch_summaries: list[dict[str, object]] = []
+
+    base_to_build_keys: set[str] = set()
+
+    def prefixed(tag: str) -> str | None:
+        return f"{remote_prefix}/{tag}" if remote_prefix else None
+
+    base_spec_by_key = {}
+    for spec in exec_specs:
+        key = spec.base_image_key
+        base_spec_by_key.setdefault(key, spec)
+        remote_tag = prefixed(key)
+
+        if remote_tag and not force_build and remote_image_exists(remote_tag):
+            logger.info("Base image %s already in registry; reusing", remote_tag)
+            try:
+                img = client.images.pull(remote_tag)
+                if remote_tag != key:
+                    img.tag(key)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning(
+                    "Failed to pull %s (%s); will rebuild locally", remote_tag, exc
+                )
+                base_to_build_keys.add(key)
+                continue
+            continue
+
+        base_to_build_keys.add(key)
+
+    missing_base_specs = [base_spec_by_key[k] for k in base_to_build_keys]
+    skipped_base = total_base - len(base_to_build_keys)
+
+    if missing_base_specs:
+        logger.info(
+            "Building %s/%s base images (skipping %s already present)",
+            len({spec.base_image_key for spec in missing_base_specs}),
+            total_base,
+            skipped_base,
+        )
+        base_build_started = time.monotonic()
+        if force_build:
+            for spec in missing_base_specs:
+                remove_image(client, spec.base_image_key, "quiet")
+        build_base_images(
+            client,
+            missing_base_specs,
+            force_rebuild=False,
+            build_mode=build_mode,
+        )
+        base_build_seconds += time.monotonic() - base_build_started
+        base_built = {spec.base_image_key for spec in missing_base_specs}
+        if image_prefix:
+            push_started = time.monotonic()
+            tag_and_push(base_built, image_prefix)
+            push_seconds += time.monotonic() - push_started
+        logger.info(
+            "Completed base image build in %.1fs: built=%d skipped=%d",
+            base_build_seconds,
+            len(base_built),
+            skipped_base,
+        )
+    else:
+        logger.info(
+            "All %s base images already exist; skipping base builds", total_base
+        )
+
+    missing_env_specs: list = []
+
+    for spec in exec_specs:
+        key = spec.env_image_key
+        remote_tag = prefixed(key)
+
+        if remote_tag and not force_build and remote_image_exists(remote_tag):
+            logger.info("Env image %s already in registry; skipping build", remote_tag)
+            continue
+
+        missing_env_specs.append(spec)
+
+    if not missing_env_specs:
+        logger.info("All %s env images already exist; skipping env builds", total_env)
+        wall_clock_seconds = time.monotonic() - overall_started
+        return {
+            "total_base_images": total_base,
+            "built_base_images": len(missing_base_specs),
+            "skipped_base_images": skipped_base,
+            "total_env_images": total_env,
+            "built_env_images": 0,
+            "skipped_env_images": total_env,
+            "base_build_seconds": round(base_build_seconds, 3),
+            "env_build_seconds": round(env_build_seconds, 3),
+            "push_seconds": round(push_seconds, 3),
+            "wall_clock_seconds": round(wall_clock_seconds, 3),
+            "batch_count": 0,
+            "batches": [],
+        }
+
+    batches = list(chunked(missing_env_specs, max(1, batch_size)))
+    logger.info(
+        "Building %s/%s unique env images across %s selected instances in %s batches (batch_size=%s)",
+        len({spec.env_image_key for spec in missing_env_specs}),
+        total_env,
+        len(missing_env_specs),
+        len(batches),
+        batch_size,
+    )
+    for idx, batch in enumerate(batches, start=1):
+        attempt = 0
+        while True:
+            batch_started = time.monotonic()
+            try:
+                batch_env_keys = {spec.env_image_key for spec in batch}
+                logger.info(
+                    "Batch %s/%s: building %s unique env images from %s selected instances",
+                    idx,
+                    len(batches),
+                    len(batch_env_keys),
+                    len(batch),
+                )
+                env_build_started = time.monotonic()
+                if force_build:
+                    for env_image_key in batch_env_keys:
+                        remove_image(client, env_image_key, "quiet")
+                build_envs(
+                    client,
+                    batch,
+                    force_rebuild=False,
+                    max_workers=max_workers,
+                    build_mode=build_mode,
+                )
+                env_build_seconds += time.monotonic() - env_build_started
+                if image_prefix:
+                    push_started = time.monotonic()
+                    tag_and_push({spec.env_image_key for spec in batch}, image_prefix)
+                    push_seconds += time.monotonic() - push_started
+                batch_duration = time.monotonic() - batch_started
+                batch_attempts = attempt + 1
+                batch_summaries.append(
+                    {
+                        "batch_index": idx,
+                        "batch_size": len(batch_env_keys),
+                        "instance_count": len(batch),
+                        "attempt_count": batch_attempts,
+                        "duration_seconds": round(batch_duration, 3),
+                    }
+                )
+                throughput = (
+                    (len(batch_env_keys) / batch_duration) * 3600
+                    if batch_duration
+                    else 0.0
+                )
+                logger.info(
+                    "Finished env batch %s/%s in %.1fs (attempts=%d, throughput=%.1f unique images/hour)",
+                    idx,
+                    len(batches),
+                    batch_duration,
+                    batch_attempts,
+                    throughput,
+                )
+                break
+            except BuildImageError as exc:
+                attempt += 1
+                if attempt > max_retries:
+                    logger.error(
+                        "Batch %s/%s failed after %s attempts: %s",
+                        idx,
+                        len(batches),
+                        max_retries,
+                        exc,
+                    )
+                    raise
+                logger.warning(
+                    "Batch %s/%s failed (attempt %s/%s): %s; retrying",
+                    idx,
+                    len(batches),
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+    wall_clock_seconds = time.monotonic() - overall_started
+    summary = {
+        "total_base_images": total_base,
+        "built_base_images": len(missing_base_specs),
+        "skipped_base_images": skipped_base,
+        "total_env_images": total_env,
+        "selected_env_instances": len(missing_env_specs),
+        "built_env_images": len({spec.env_image_key for spec in missing_env_specs}),
+        "skipped_env_images": total_env
+        - len({spec.env_image_key for spec in missing_env_specs}),
+        "base_build_seconds": round(base_build_seconds, 3),
+        "env_build_seconds": round(env_build_seconds, 3),
+        "push_seconds": round(push_seconds, 3),
+        "wall_clock_seconds": round(wall_clock_seconds, 3),
+        "batch_count": len(batch_summaries),
+        "batches": batch_summaries,
+    }
+    logger.info(
+        "Eval env build summary: base built=%s skipped=%s env built=%s skipped=%s wall-clock=%.1fs",
+        summary["built_base_images"],
+        summary["skipped_base_images"],
+        summary["built_env_images"],
+        summary["skipped_env_images"],
+        wall_clock_seconds,
+    )
+    return summary
+
+
+def chunked(seq: Sequence, size: int) -> Iterator[List]:
+    for i in range(0, len(seq), size):
+        yield list(seq[i : i + size])
+
+
+def tag_and_push(images: Iterable[str], prefix: str) -> list[str]:
+    """
+    Tag the provided images with the registry prefix and push them.
+    """
+    pushed: list[str] = []
+    prefix = prefix.rstrip("/")
+    for image in images:
+        target = f"{prefix}/{image}"
+        logger.info("Pushing %s -> %s", image, target)
+        subprocess_run(["docker", "tag", image, target])
+        subprocess_run(["docker", "push", target])
+        pushed.append(target)
+    return pushed
+
+
+def subprocess_run(cmd: list[str]) -> None:
+    import subprocess
+
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.returncode != 0:
+        logger.error("Command failed (%s): %s", " ".join(cmd), result.stderr)
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Build and push prebaked SWT-bench eval env images."
+    )
+    parser.add_argument("--dataset", help="Dataset name")
+    parser.add_argument("--split", help="Dataset split")
+    parser.set_defaults(
+        dataset=EVAL_DEFAULTS["dataset"],
+        split=EVAL_DEFAULTS["split"],
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=1,
+        help="Match inference sampling by limiting instances (0 to disable)",
+    )
+    parser.add_argument(
+        "--instance-ids",
+        default="",
+        help="Comma-separated instance IDs to force (overrides eval-limit)",
+    )
+    parser.add_argument(
+        "--selected-instances-file",
+        default="",
+        help="Optional selected instances file used during inference",
+    )
+    parser.add_argument(
+        "--image-prefix",
+        default="ghcr.io/openhands/swtbench-eval",
+        help="Registry prefix for pushed images",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Parallel builds for env images",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retries per batch for env image builds",
+    )
+    parser.add_argument(
+        "--build-batch-size",
+        type=int,
+        default=10,
+        help="Number of env images to build per batch",
+    )
+    parser.add_argument(
+        "--build-mode",
+        choices=["api", "cli"],
+        default="cli",
+        help="swt-bench build mode",
+    )
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help="Build images locally without pushing to the registry",
+    )
+    parser.add_argument(
+        "--force-build",
+        action="store_true",
+        help="Rebuild images even if matching remote tags already exist",
+    )
+    args = parser.parse_args()
+
+    instance_ids = (
+        [iid for iid in args.instance_ids.split(",") if iid]
+        if args.instance_ids
+        else None
+    )
+    eval_limit = None if instance_ids else args.eval_limit
+    selected_file = args.selected_instances_file or None
+
+    swt_bench_dir = ensure_swt_bench_repo()
+
+    target_ids = select_instance_ids(
+        dataset=args.dataset,
+        split=args.split,
+        eval_limit=eval_limit,
+        selected_instances_file=selected_file,
+        instance_ids=instance_ids,
+    )
+    exec_specs = load_exec_specs(
+        swt_bench_dir, args.dataset, args.split, target_ids, filter_swt=True
+    )
+    summary = build_env_images(
+        exec_specs,
+        max_workers=args.max_workers,
+        build_mode=args.build_mode,
+        max_retries=args.max_retries,
+        batch_size=args.build_batch_size,
+        image_prefix=None if args.no_push else args.image_prefix,
+        force_build=args.force_build,
+    )
+
+    base_images = {spec.base_image_key for spec in exec_specs}
+    env_images = {spec.env_image_key for spec in exec_specs}
+    logger.info("Built images: %s base, %s env", len(base_images), len(env_images))
+
+    manifest = {
+        "dataset": args.dataset,
+        "split": args.split,
+        "instances": target_ids,
+        "base_images": sorted(base_images),
+        "env_images": sorted(env_images),
+        "image_prefix": args.image_prefix,
+        "arch": "host",
+        "summary": summary,
+    }
+    build_dir = default_build_output_dir(args.dataset, args.split)
+    summary_path = build_dir / "eval-env-summary.json"
+    summary_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    logger.info("Wrote eval env summary to %s", summary_path)
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()

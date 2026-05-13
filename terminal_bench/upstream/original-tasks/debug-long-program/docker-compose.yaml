@@ -1,0 +1,31 @@
+services:
+  client:
+    image: ghcr.io/${GHCR_USER}/tb-debug-long-program:v1
+    pull_policy: always
+    network_mode: host
+    container_name: ${T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME}
+    command:
+    - sh
+    - -c
+    - echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99no-sandbox; mkdir
+      -p /etc/dpkg/dpkg.cfg.d; echo 'force-unsafe-io' > /etc/dpkg/dpkg.cfg.d/99unsafe-io;
+      echo '127.0.0.1 program' >> /etc/hosts; sleep infinity
+    environment:
+    - TEST_DIR=${T_BENCH_TEST_DIR}
+    - TAR_OPTIONS=--no-same-owner
+    volumes:
+    - ${T_BENCH_TASK_LOGS_PATH}:${T_BENCH_CONTAINER_LOGS_PATH}
+    - ${T_BENCH_TASK_AGENT_LOGS_PATH}:${T_BENCH_CONTAINER_AGENT_LOGS_PATH}
+    depends_on:
+    - program
+  program:
+    image: python:3.13-slim-bookworm
+    volumes:
+    - ./debug_server.py:/app/debug_server.py
+    environment:
+    - PYTHONUNBUFFERED=1
+    command:
+    - sh
+    - -c
+    - pip install flask flask-cors && python /app/debug_server.py
+    network_mode: host

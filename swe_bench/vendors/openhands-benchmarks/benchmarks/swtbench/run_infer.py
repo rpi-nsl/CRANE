@@ -1,0 +1,438 @@
+import json
+import os
+from typing import Any, List
+
+from jinja2 import Environment, FileSystemLoader
+
+from benchmarks.swtbench.config import INFER_DEFAULTS
+from benchmarks.utils.acp import (
+    add_acp_agent_metadata,
+    build_acp_agent,
+    get_acp_forward_env,
+    is_acp_agent,
+    setup_acp_workspace,
+    workspace_keepalive,
+)
+from benchmarks.utils.agent_context import create_agent_context
+from benchmarks.utils.args_parser import add_prompt_path_argument, get_parser
+from benchmarks.utils.console_logging import summarize_instance
+from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
+from benchmarks.utils.conversation import build_event_persistence_callback
+from benchmarks.utils.critics import create_critic
+from benchmarks.utils.dataset import get_dataset
+from benchmarks.utils.evaluation import Evaluation
+from benchmarks.utils.evaluation_utils import (
+    construct_eval_output_dir,
+    get_default_on_result_writer,
+)
+from benchmarks.utils.fake_user_response import run_conversation_with_fake_user_response
+from benchmarks.utils.image_utils import (
+    create_docker_workspace,
+    remote_image_exists,
+)
+from benchmarks.utils.litellm_proxy import build_eval_llm
+from benchmarks.utils.llm_config import load_llm_config
+from benchmarks.utils.models import (
+    EvalInstance,
+    EvalMetadata,
+    EvalOutput,
+)
+from benchmarks.utils.version import get_phased_image_tag_prefix
+from openhands.sdk import Agent, Conversation, Tool, __version__, get_logger
+from openhands.sdk.agent import ACPAgent
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
+from openhands.sdk.workspace import RemoteWorkspace
+from openhands.tools.delegate import DelegateTool
+from openhands.tools.preset.default import get_default_tools
+from openhands.workspace import APIRemoteWorkspace
+
+
+logger = get_logger(__name__)
+
+
+def get_official_docker_image(
+    instance_id: str,
+    docker_image_prefix="docker.io/swebench/",
+) -> str:
+    # Official SWE-Bench image
+    # swebench/sweb.eval.x86_64.django_1776_django-11333:v1
+    repo, name = instance_id.split("__")
+    official_image_name = docker_image_prefix.rstrip("/")
+    official_image_name += f"/sweb.eval.x86_64.{repo}_1776_{name}:latest".lower()
+    logger.debug(f"Using official SWE-Bench image: {official_image_name}")
+    return official_image_name
+
+
+def get_agent_server_docker_image(
+    instance_id: str,
+    docker_image_prefix="docker.io/swtbench/",
+    target: str = "source-minimal",
+) -> str:
+    """Get the agent server Docker image for an instance."""
+    # Importing here because openhands.agent_server.docker.build runs git checks
+    # which fails when installed as a package outside the git repo
+    from openhands.agent_server.docker.build import _base_slug
+
+    official_image_name = get_official_docker_image(instance_id, docker_image_prefix)
+    return (
+        "ghcr.io/all-hands-ai/agent-server"
+        + f":v{__version__}_{_base_slug(official_image_name)}_{target}"
+    )
+
+
+def get_instruction(
+    instance: dict,
+    metadata: EvalMetadata,
+    workspace_path: str,
+) -> str:
+    """Generate instruction for the agent."""
+    # For SWT-bench, workspace directory name might be different
+    if "repo" in instance:
+        workspace_dir_name = instance["repo"].split("/")[-1]
+    elif "instance_id" in instance:
+        workspace_dir_name = instance["instance_id"].replace("/", "_")
+    else:
+        workspace_dir_name = "workspace"
+
+    assert metadata.details is not None
+
+    # Set up Jinja2 environment
+    assert metadata.prompt_path is not None
+    prompts_dir = os.path.dirname(metadata.prompt_path)
+    template_name = os.path.basename(metadata.prompt_path)
+    env = Environment(loader=FileSystemLoader(prompts_dir))
+    template = env.get_template(template_name)
+
+    # Prepare context for rendering
+    context = {
+        "instance": instance,
+        "workspace_dir_name": workspace_dir_name,
+        "actual_workspace_path": workspace_path,
+        "metadata": metadata,
+    }
+
+    # Add test instructions if available
+    test_instructions = ""
+    if "test_cmd" in instance and instance["test_cmd"]:
+        test_instructions = f"""
+The test command to verify your implementation is:
+```bash
+{instance["test_cmd"]}
+```
+
+Make sure your implementation passes this test.
+"""
+    context["test_instructions"] = test_instructions
+
+    # Render the instruction
+    instruction = template.render(context)
+    return instruction
+
+
+class SWTBenchEvaluation(Evaluation):
+    """
+    Process-based SWT-bench evaluation implemented as a child of the
+    abstract Evaluation orchestrator.
+
+    Implements:
+      - prepare_instances()
+      - prepare_workspace(instance)
+      - evaluate_instance(instance, workspace)
+    """
+
+    def prepare_instances(self) -> List[EvalInstance]:
+        logger.info("Setting up SWT-bench evaluation data")
+
+        df = get_dataset(
+            dataset_name=self.metadata.dataset,
+            split=self.metadata.dataset_split,
+            eval_limit=self.metadata.eval_limit,
+            selected_instances_file=self.metadata.selected_instances_file,
+        )
+
+        instances: List[EvalInstance] = []
+        for _, row in df.iterrows():
+            inst_id = str(row["instance_id"])
+            instances.append(EvalInstance(id=inst_id, data=row.to_dict()))
+
+        logger.info("Total instances to process: %d", len(instances))
+        return instances
+
+    # ---- Hook: prepare a workspace per instance ----------------------------------
+    def prepare_workspace(
+        self,
+        instance: EvalInstance,
+        resource_factor: int = 1,
+        forward_env: list[str] | None = None,
+    ) -> RemoteWorkspace:
+        """
+        Create workspace based on workspace_type (docker or remote).
+
+        Args:
+            instance: The evaluation instance to prepare workspace for.
+            resource_factor: Resource factor for runtime allocation (default: 1).
+                           Higher values allocate more CPU/memory resources.
+                           Used by APIRemoteWorkspace for remote runtime allocation.
+            forward_env: Environment variables to forward into the workspace.
+        """
+        forward_env = get_acp_forward_env(self.metadata.agent_type, forward_env)
+
+        official_docker_image = get_official_docker_image(instance.id)
+        build_target = "source-minimal"
+
+        # Create a custom tag for the image
+        name_tag = official_docker_image.split("/")[-1]
+        custom_tag = name_tag.split(":")[0]
+        # For non-binary targets, append target suffix
+        suffix = f"-{build_target}" if build_target != "binary" else ""
+
+        if self.metadata.workspace_type == "docker":
+            agent_server_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{custom_tag}{suffix}"
+            workspace = create_docker_workspace(
+                agent_server_image=agent_server_image,
+                base_image=official_docker_image,
+                build_target=build_target,
+                forward_env=forward_env,
+            )
+        elif self.metadata.workspace_type == "remote":
+            runtime_api_key = os.getenv("RUNTIME_API_KEY")
+            if not runtime_api_key:
+                raise ValueError(
+                    "RUNTIME_API_KEY environment variable is not set for remote workspace"
+                )
+
+            agent_server_image = f"{EVAL_AGENT_SERVER_IMAGE}:{get_phased_image_tag_prefix()}-{custom_tag}{suffix}"
+            if not remote_image_exists(agent_server_image):
+                raise RuntimeError(
+                    f"Agent server image {agent_server_image} does not exist in container registry, "
+                    "make sure to build, push it, and make it public accessible before using remote workspace."
+                )
+            logger.info(
+                f"Using remote workspace with image {agent_server_image} "
+                f"(tag prefix: {get_phased_image_tag_prefix()}, resource_factor: {resource_factor})"
+            )
+            startup_timeout = float(os.getenv("REMOTE_RUNTIME_STARTUP_TIMEOUT", "600"))
+            workspace = APIRemoteWorkspace(
+                runtime_api_url=os.getenv(
+                    "RUNTIME_API_URL", "https://runtime.eval.all-hands.dev"
+                ),
+                runtime_api_key=runtime_api_key,
+                server_image=agent_server_image,
+                target_type="source" if "source" in build_target else "binary",
+                forward_env=forward_env or [],
+                resource_factor=resource_factor,
+                init_timeout=startup_timeout,
+                startup_wait_timeout=startup_timeout,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported workspace_type: {self.metadata.workspace_type}"
+            )
+
+        for cmd in self.metadata.env_setup_commands or []:
+            res = workspace.execute_command(cmd)
+            if res.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to run env setup command '{cmd}': {res.stderr}"
+                )
+            logger.debug(f"Ran env setup command '{cmd}': {res.stdout}")
+        return workspace
+
+    # ---- Hook: evaluate one instance ---------------------------------------------
+    def evaluate_instance(
+        self,
+        instance: EvalInstance,
+        workspace: RemoteWorkspace,
+    ) -> EvalOutput:
+        """
+        Create conversation, run agent, collect history and git patch.
+        Do not write files here; just return EvalOutput.
+        """
+        if is_acp_agent(self.metadata.agent_type):
+            agent = build_acp_agent(self.metadata.agent_type, self.metadata.llm.model)
+        else:
+            agent_llm = build_eval_llm(self.metadata.llm)
+            tools = get_default_tools(
+                # Disable browser tools in CLI mode
+                enable_browser=False,
+            )
+            if self.metadata.enable_delegation:
+                tools.append(Tool(name=DelegateTool.name))
+            condenser = None
+            if self.metadata.enable_condenser:
+                condenser = LLMSummarizingCondenser(
+                    llm=build_eval_llm(self.metadata.llm, usage_id="condenser"),
+                    max_size=self.metadata.condenser_max_size,
+                    keep_first=self.metadata.condenser_keep_first,
+                )
+            # Load public skills (respects EXTENSIONS_REF env var)
+            agent_context = create_agent_context()
+
+            agent = Agent(
+                llm=agent_llm,
+                tools=tools,
+                system_prompt_kwargs={"cli_mode": True},
+                agent_context=agent_context,
+                condenser=condenser,
+                # TODO: we can enable security analyzer later
+                # security_analyzer=LLMSecurityAnalyzer(),
+            )
+
+        assert isinstance(workspace, RemoteWorkspace)
+
+        setup_acp_workspace(self.metadata.agent_type, workspace)
+
+        repo_path = f"/workspace/{instance.data['repo'].split('/')[-1]}/"
+        instance.data["repo_path"] = repo_path
+
+        persist_callback = build_event_persistence_callback(
+            run_id=self.metadata.eval_output_dir,
+            instance_id=instance.id,
+            attempt=self.current_attempt,
+        )
+
+        conversation = Conversation(
+            agent=agent,
+            workspace=workspace,
+            callbacks=[persist_callback],
+            max_iteration_per_run=self.metadata.max_iterations,
+            delete_on_close=True,
+        )
+
+        logger.info("repo_path: %s", repo_path)
+        cp_testebed_repo = workspace.execute_command(
+            (f"mkdir -p {repo_path} ; cp -r /testbed/. {repo_path}")
+        )
+        assert cp_testebed_repo.exit_code == 0, (
+            f"cp_testebed_repo failed: {cp_testebed_repo.stderr}"
+        )
+
+        # git reset
+        git_reset = workspace.execute_command(f"cd {repo_path} ; git reset --hard")
+        assert git_reset.exit_code == 0, f"git reset failed: {git_reset.stderr}"
+
+        instruction = get_instruction(
+            instance=instance.data,
+            metadata=self.metadata,
+            workspace_path=workspace.working_dir,
+        )
+        with workspace_keepalive(self.metadata.agent_type, workspace):
+            conversation.send_message(instruction)
+            # Run conversation with fake user responses to handle agent messages
+            run_conversation_with_fake_user_response(conversation)
+
+        # git add
+        workspace.execute_command(f"cd {repo_path} ; git add -A")
+
+        # git commit
+        # Use --no-verify to bypass pre-commit hooks (e.g., husky) that can fail
+        workspace.execute_command(
+            f"cd {repo_path} && "
+            "git config --global user.email 'evaluation@openhands.dev' && "
+            "git config --global user.name 'OpenHands Evaluation' && "
+            "git commit --no-verify -m 'patch'"
+        )
+
+        # Get git patch
+        base_commit = instance.data["base_commit"]
+        git_patch_result = workspace.execute_command(
+            (f"cd {repo_path} ; git --no-pager diff --no-color {base_commit} HEAD")
+        )
+        assert git_patch_result.exit_code == 0, (
+            f"git diff failed: {git_patch_result.stderr}"
+        )
+        git_patch = git_patch_result.stdout
+
+        # Log instance summary
+        summarize_instance(
+            instance_id=instance.id,
+            conversation=conversation,
+            git_patch=git_patch or "",
+            logger=logger,
+        )
+
+        test_result: dict[str, Any] = {
+            "git_patch": git_patch,
+        }
+        if isinstance(agent, ACPAgent):
+            add_acp_agent_metadata(test_result, conversation)
+
+        out = EvalOutput(
+            instance_id=instance.id,
+            attempt=self.current_attempt,
+            test_result=test_result,
+            instruction=instruction,
+            error=None,
+            history=list(conversation.state.events),
+            metrics=conversation.conversation_stats.get_combined_metrics(),
+        )
+        return out
+
+
+def main() -> None:
+    """Main entry point for SWT-bench evaluation."""
+    parser = get_parser()
+    add_prompt_path_argument(parser, __file__)
+    parser.set_defaults(**INFER_DEFAULTS)
+    args = parser.parse_args()
+
+    # Validate n_critic_runs
+    if args.n_critic_runs < 1:
+        raise ValueError(f"n_critic_runs must be >= 1, got {args.n_critic_runs}")
+
+    llm = load_llm_config(args.llm_config_path)
+    logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
+
+    dataset_description = (
+        args.dataset.replace("/", "__") + "-" + args.split.replace("/", "__")
+    )
+
+    structured_output_dir = construct_eval_output_dir(
+        base_dir=args.output_dir,
+        dataset_name=dataset_description,
+        model_name=llm.model,
+        max_iterations=args.max_iterations,
+        eval_note=f"SWT-{args.note}" if args.note else None,
+    )
+
+    critic = create_critic(args)
+
+    # Handle condenser configuration
+    # --disable-condenser takes precedence over --enable-condenser and defaults
+    enable_condenser = args.enable_condenser
+    if args.disable_condenser:
+        enable_condenser = False
+
+    metadata = EvalMetadata(
+        llm=llm,
+        dataset=args.dataset,
+        dataset_split=args.split,
+        max_iterations=args.max_iterations,
+        eval_output_dir=structured_output_dir,
+        details={},
+        prompt_path=args.prompt_path,
+        eval_limit=args.n_limit,
+        env_setup_commands=["export PIP_CACHE_DIR=~/.cache/pip"],
+        n_critic_runs=args.n_critic_runs,
+        critic=critic,
+        selected_instances_file=args.select,
+        max_retries=args.max_retries,
+        workspace_type=args.workspace,
+        enable_delegation=args.enable_delegation,
+        agent_type=args.agent_type,
+        enable_condenser=enable_condenser,
+        condenser_max_size=args.condenser_max_size,
+        condenser_keep_first=args.condenser_keep_first,
+    )
+
+    # Run orchestrator with a simple JSONL writer
+    evaluator = SWTBenchEvaluation(metadata=metadata, num_workers=args.num_workers)
+
+    evaluator.run(on_result=get_default_on_result_writer(evaluator.output_path))
+
+    logger.info("Evaluation completed!")
+    print(json.dumps({"output_json": str(evaluator.output_path)}))
+
+
+if __name__ == "__main__":
+    main()

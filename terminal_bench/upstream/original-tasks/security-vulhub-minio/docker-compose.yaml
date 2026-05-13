@@ -1,0 +1,66 @@
+services:
+  client:
+    image: ghcr.io/${GHCR_USER}/tb-security-vulhub-minio:v1
+    pull_policy: always
+    network_mode: host
+    container_name: ${T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME}
+    command:
+    - sh
+    - -c
+    - echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99no-sandbox; mkdir
+      -p /etc/dpkg/dpkg.cfg.d; echo 'force-unsafe-io' > /etc/dpkg/dpkg.cfg.d/99unsafe-io;
+      echo '127.0.0.1 node1' >> /etc/hosts; echo '127.0.0.1 node2' >> /etc/hosts;
+      echo '127.0.0.1 node3' >> /etc/hosts; sleep infinity
+    environment:
+    - TEST_DIR=${T_BENCH_TEST_DIR}
+    - TAR_OPTIONS=--no-same-owner
+    volumes:
+    - ${T_BENCH_TASK_LOGS_PATH}:${T_BENCH_CONTAINER_LOGS_PATH}
+    - ${T_BENCH_TASK_AGENT_LOGS_PATH}:${T_BENCH_CONTAINER_AGENT_LOGS_PATH}
+  node1:
+    image: vulhub/minio:2023-02-27T18-10-45Z
+    environment:
+    - MINIO_ROOT_USER=minioadmin
+    - MINIO_ROOT_PASSWORD=minioadmin-vulhub
+    command:
+    - minio
+    - server
+    - --console-address
+    - :9001
+    - http://node1:9000/mnt/data1
+    - http://node2:9000/mnt/data2
+    - http://node3:9000/mnt/data3
+    hostname: node1
+    volumes:
+    - /mnt/data1
+    network_mode: host
+  node2:
+    image: vulhub/minio:2023-02-27T18-10-45Z
+    environment:
+    - MINIO_ROOT_USER=minioadmin
+    - MINIO_ROOT_PASSWORD=minioadmin-vulhub
+    command:
+    - minio
+    - server
+    - http://node1:9000/mnt/data1
+    - http://node2:9000/mnt/data2
+    - http://node3:9000/mnt/data3
+    hostname: node2
+    volumes:
+    - /mnt/data2
+    network_mode: host
+  node3:
+    image: vulhub/minio:2023-02-27T18-10-45Z
+    environment:
+    - MINIO_ROOT_USER=minioadmin
+    - MINIO_ROOT_PASSWORD=minioadmin-vulhub
+    command:
+    - minio
+    - server
+    - http://node1:9000/mnt/data1
+    - http://node2:9000/mnt/data2
+    - http://node3:9000/mnt/data3
+    hostname: node3
+    volumes:
+    - /mnt/data3
+    network_mode: host

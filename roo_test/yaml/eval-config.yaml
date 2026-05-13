@@ -1,0 +1,44 @@
+# Roo Code Eval Configuration
+# ============================
+# For testing a vLLM service running at localhost:8003
+
+# ── Model Settings ────────────────────────────────────────────────────────────
+
+# Provider: use "openai" for any OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, etc.)
+provider: openai
+
+# Model name served by your vLLM instance
+# Run `curl http://localhost:8003/v1/models` to list available models
+model: "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+# API key - vLLM default is "EMPTY", change if your instance requires one
+api_key: "EMPTY"
+
+# Base URL of your vLLM service (must end with /v1)
+base_url: "http://localhost:8003/v1"
+
+
+# ── Exercise Settings ─────────────────────────────────────────────────────────
+
+# Languages to test. Supported: python, javascript, go, rust, java
+# Only include languages whose runtimes are installed on this machine
+languages:
+  - python
+  - javascript
+  - go
+  - rust
+  # - java   # Uncomment if Java/Gradle is installed
+
+# Path to the cloned Roo-Code-Evals repository
+# Run setup-eval.sh to clone it automatically
+evals_repo: "./evals"
+
+
+# ── Runner Settings ───────────────────────────────────────────────────────────
+
+# Number of exercises to run in parallel
+# Start with 1 to verify things work, then increase
+concurrency: 1
+
+# Timeout per exercise (seconds) — how long to wait for the model to finish coding
+timeout_seconds: 300
