@@ -215,9 +215,15 @@ split + per-task solve counts).
 
 ## Citation
 
-If you use this code, please cite the paper. (BibTeX will be added on
-acceptance.)
-
+If you use this code, please cite the paper. 
+```bibtex
+@article{zhu2026crane,
+  title={CRANE: Constrained Reasoning Injection for Code Agents via Nullspace Editing},
+  author={Zhu, Mingzhi and Merler, Michele and Pavuluri, Raju and Patterson, Stacy},
+  journal={arXiv preprint arXiv:2605.14084},
+  year={2026}
+}
+```
 ## License
 
 Apache 2.0 (see `LICENSE`). Upstream dependencies retain their own
