@@ -217,11 +217,14 @@ split + per-task solve counts).
 
 If you use this code, please cite the paper. 
 ```bibtex
-@article{zhu2026crane,
-  title={CRANE: Constrained Reasoning Injection for Code Agents via Nullspace Editing},
-  author={Zhu, Mingzhi and Merler, Michele and Pavuluri, Raju and Patterson, Stacy},
-  journal={arXiv preprint arXiv:2605.14084},
-  year={2026}
+@misc{zhu2026crane,
+  title        = {CRANE: Constrained Reasoning Injection for Code Agents via Nullspace Editing},
+  author       = {Zhu, Mingzhi and Merler, Michele and Pavuluri, Raju and Patterson, Stacy},
+  year         = {2026},
+  eprint       = {2605.14084},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.SE},
+  url          = {https://arxiv.org/abs/2605.14084}
 }
 ```
 ## License
